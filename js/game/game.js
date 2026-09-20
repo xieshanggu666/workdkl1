@@ -102,6 +102,7 @@ FG.Game = class Game {
         phase: b.phase, timer: b.timer,
         level: b.level, fluidType: b.fluidType, chest: b.chest, oreType: b.oreType,
         consumeCounter: b.consumeCounter, totalCrafted: b.totalCrafted,
+        craftedByItem: b.craftedByItem ? Object.assign({}, b.craftedByItem) : {},
         rr: b.rr, filter: b.filter, demandMode: b.demandMode,
         priority: b.priority, status: b.status,
         stationId: b.stationId || null, stationName: b.stationName || null,
@@ -172,6 +173,25 @@ FG.Game = class Game {
       b.oreType = sb.oreType || null;
       b.consumeCounter = sb.consumeCounter || 0;
       b.totalCrafted = sb.totalCrafted || 0;
+      // 分产物累计完成次数（试产闸门按产物归属增量，切换配方后旧产物不计入新产物）
+      if (sb.craftedByItem && typeof sb.craftedByItem === 'object') {
+        b.craftedByItem = {};
+        for (const k of Object.keys(sb.craftedByItem)) {
+          const v = sb.craftedByItem[k] | 0;
+          if (v > 0) b.craftedByItem[k] = v;
+        }
+      } else {
+        b.craftedByItem = {};
+        // 旧档无分产物计数：只能按「当前配方产物 / 矿机所在矿种」归属全部历史产量；
+        // 为避免错归属，施工计划的试产基线在读档迁移时统一重置（见 construction.deserialize）
+        const r = b.recipe ? FG.Recipes.byId(b.recipe) : null;
+        if (r) {
+          for (const res of r.results) if (!FG.Items.isFluid(res.item)) b.craftedByItem[res.item] = b.totalCrafted;
+        } else if (b.type === 'miner') {
+          const ore = this.map.inBounds(b.x, b.y) && this.map.ores[b.y][b.x] ? this.map.ores[b.y][b.x].type : b.oreType;
+          if (ore) b.craftedByItem[ore] = b.totalCrafted;
+        }
+      }
       b.rr = sb.rr || 0;
       b.filter = sb.filter || null;
       b.demandMode = !!sb.demandMode;
@@ -202,8 +222,8 @@ FG.Game = class Game {
       this.stats.totals = data.totals;
       for (const id of Object.keys(data.totals)) this.stats.recordProduce(id, 0); // 登记 itemIds
     }
-    // 施工计划与蓝图剪贴板（旧存档无此字段 → 空计划/空剪贴板）
-    this.construction.deserialize(data.construction || null);
+    // 施工计划与蓝图剪贴板（旧存档无此字段 → 空计划/空剪贴板；旧版试产状态一并迁移）
+    this.construction.deserialize(data.construction || null, data.v);
     this.blueprint = data.blueprint || null;
     // 铁路：列车在途货物与调度状态随档恢复（占用表由列车位置重建）
     this.railway.deserialize(data.railway || null);

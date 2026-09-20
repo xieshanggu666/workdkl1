@@ -101,7 +101,8 @@ FG.Map = class {
       stationId: null,
       stationName: null,
       // 统计
-      totalCrafted: 0,
+      totalCrafted: 0,       // 累计完成生产次数（跨全部配方/产物）
+      craftedByItem: {},     // 分产物累计完成次数 {item: n}：切换配方后旧产物不计入新产物
     };
     if (def.storage) {
       for (let i = 0; i < FG.Config.CHEST_SLOTS; i++) b.chest.push({ type: null, count: 0, cap: FG.Config.CHEST_SLOT_CAP });

@@ -510,6 +510,12 @@ FG.Sim = class Sim {
         stats.recordProduce(r.item, r.count);
       }
       b.totalCrafted++;
+      // 分产物记账：每种固体产物各 +1（当前配方每种固体产物仅 1 个结果；
+      // 切换配方后旧产物的累计数不受影响，分阶段试产按产物归属增量）
+      if (!b.craftedByItem) b.craftedByItem = {};
+      for (const r of recipe.results) {
+        if (!FG.Items.isFluid(r.item)) b.craftedByItem[r.item] = (b.craftedByItem[r.item] || 0) + 1;
+      }
     }
     this.pushOutputs(b, recipe);
   }
@@ -543,6 +549,8 @@ FG.Sim = class Sim {
         ore.amount -= 2;
         this.game.stats.recordProduce(ore.type, 1);
         b.totalCrafted++;
+        if (!b.craftedByItem) b.craftedByItem = {};
+        b.craftedByItem[ore.type] = (b.craftedByItem[ore.type] || 0) + 1;
       }
     }
   }

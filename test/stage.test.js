@@ -2,7 +2,8 @@
  * 分阶段产线施工测试：node test/stage.test.js
  * 默认单阶段 → 切分阶段（建成闸门：后续挂起不占料、闸门开放后续建）→
  * 试产达标闸门（产物限定/基线）→ 闸门建筑被拆联动挂起并释放预留、重建自动放行 →
- * 升级计划分阶段 → 阶段进度随存档恢复 → 兼容旧存档
+ * 升级计划分阶段 → 阶段进度随存档恢复 → 兼容旧存档 →
+ * 切配方产量归属（旧产物次数不串计新产物）→ 旧档误放行迁移
  */
 const fs = require('fs');
 const path = require('path');
@@ -395,7 +396,9 @@ console.log('\n[11] 阶段进度随存档恢复：切分/闸门/试产基线/ope
   ok(data.construction.plans[0].stages.length === 2, '存档包含 2 个阶段');
   const sg = data.construction.plans[0].stages[0].gate;
   ok(sg.mode === 'trial' && sg.item === 'ironPlate' && sg.n === 5, '闸门（试产/铁板/5 次）序列化');
-  ok(typeof data.construction.plans[0].entries[0].base === 'number', '试产基线 base 随条目保存');
+  const base0 = data.construction.plans[0].entries[0].base;
+  ok(base0 && typeof base0.total === 'number' && base0.items && typeof base0.items === 'object',
+    '试产基线 base 随条目保存（结构化 {total, items}）');
 
   const g2 = new FG.Game();
   g2.deserialize(data);
@@ -485,6 +488,180 @@ console.log('\n[13] 多阶段：试产达标后第三阶段才放行（端到端
   ticks(game, 12);
   ok(!!game.map.buildingAt(22, 24), '阶段1建成闸门开放 → 阶段2建成');
   ok(game.construction.plans.length === 0, '三阶段计划完工');
+}
+
+// ============================================================
+console.log('\n[14] 切配方产量归属：旧产物的生产次数不计入新产物试产闸门（误放行修复）');
+{
+  const game = mkGame();
+  const chest = P(game, 'chest', 5, 5);
+  game.sim.chestAdd(chest, 'stone', 5);
+  game.sim.chestAdd(chest, 'ironPlate', 4);
+  game.sim.chestAdd(chest, 'circuit', 1);
+  const p = submit(game, [
+    bpEntry('furnace', 0, 0, 0, { recipe: 'smelt:iron' }),
+    bpEntry('lab', 1, 0, 0),
+  ], 20, 34);
+  game.construction.splitStage(p.id, 1);
+  game.construction.setStageGate(p.id, 0, { mode: 'trial', item: 'copperPlate', n: 3 });
+  ticks(game, 10);
+  const fur = game.map.buildingAt(20, 34);
+  ok(!!fur, '熔炉建成，进入试产等待（铜板 3 次闸门，当前炼铁板）');
+
+  // 先炼 5 次铁板（旧产物，与闸门无关）
+  fur.slots.inputs.ironOre.count = 12;
+  ticks(game, 120);
+  game.construction.reconcileStages(p);
+  ok(fur.totalCrafted >= 5, '熔炉已炼 ≥5 块铁板（实际 ' + fur.totalCrafted + '）');
+  ok(game.construction.trialProgress(p, 0) === 0,
+    '铁板不计入铜板闸门：进度 0/3（实际 ' + game.construction.trialProgress(p, 0) + '）');
+
+  // 切到铜板配方但尚未产出 → 不得因旧铁板次数误放行
+  game.setRecipe(fur, 'smelt:copper');
+  game.construction.reconcileStages(p);
+  ok(game.construction.trialProgress(p, 0) === 0,
+    '切配方后未产铜板前：进度仍 0/3（实际 ' + game.construction.trialProgress(p, 0) + '）');
+  ok(p.stages[0].gate.opened === false && !game.map.buildingAt(21, 34),
+    '闸门未误开放，阶段 2 实验室不落成');
+
+  // 炼 2 次铜板（不足 3）→ 仍挂起
+  fur.slots.inputs.copperOre.count = 4;
+  ticks(game, 45);
+  game.construction.reconcileStages(p);
+  ok(game.construction.trialProgress(p, 0) === 2,
+    '炼出 2 块铜板：进度 2/3（实际 ' + game.construction.trialProgress(p, 0) + '）');
+  ok(p.stages[0].gate.opened === false, '2/3 未达标，闸门仍关闭');
+
+  // 再炼 1 次铜板 → 达标放行；切回铁板不会冲掉已计入的铜板次数
+  fur.slots.inputs.copperOre.count += 5;
+  ticks(game, 25);
+  game.construction.tick();
+  ok(game.construction.trialProgress(p, 0) >= 3 && p.stages[0].gate.opened === true,
+    '炼够 3 块铜板：进度 ' + game.construction.trialProgress(p, 0) + '，闸门正确开放');
+}
+
+// ============================================================
+console.log('\n[15] 反向切配方：先炼他物，切回目标产物后仅统计目标产物次数');
+{
+  const game = mkGame();
+  const chest = P(game, 'chest', 5, 5);
+  game.sim.chestAdd(chest, 'stone', 5);
+  const p = submit(game, [
+    bpEntry('furnace', 0, 0, 0, { recipe: 'smelt:iron' }),
+    bpEntry('lab', 1, 0, 0),
+  ], 24, 34);
+  game.construction.splitStage(p.id, 1);
+  game.construction.setStageGate(p.id, 0, { mode: 'trial', item: 'ironPlate', n: 3 });
+  ticks(game, 10);
+  const fur = game.map.buildingAt(24, 34);
+
+  // 基线建立后先炼铜板 5 次（与铁板闸门无关）
+  game.setRecipe(fur, 'smelt:copper');
+  fur.slots.inputs.copperOre.count = 12;
+  ticks(game, 120);
+  game.construction.reconcileStages(p);
+  ok(game.construction.trialProgress(p, 0) === 0,
+    '炼铜板不计入铁板闸门：进度 0（实际 ' + game.construction.trialProgress(p, 0) + '）');
+
+  // 切回铁板炼 2 次
+  game.setRecipe(fur, 'smelt:iron');
+  fur.slots.inputs.ironOre.count = 4;
+  ticks(game, 45);
+  game.construction.reconcileStages(p);
+  ok(game.construction.trialProgress(p, 0) === 2,
+    '切回铁板后炼 2 次：进度 2/3（实际 ' + game.construction.trialProgress(p, 0) + '，旧铜板次数不串计）');
+}
+
+// ============================================================
+console.log('\n[16] 分项产量随存档往返；新档真实达标的已开放闸门不被迁移误关');
+{
+  const game = mkGame();
+  const chest = P(game, 'chest', 5, 5);
+  game.sim.chestAdd(chest, 'stone', 5);
+  game.sim.chestAdd(chest, 'ironPlate', 4);
+  game.sim.chestAdd(chest, 'circuit', 1);
+  const p = submit(game, [
+    bpEntry('furnace', 0, 0, 0, { recipe: 'smelt:iron' }),
+    bpEntry('lab', 1, 0, 0),
+  ], 30, 34);
+  game.construction.splitStage(p.id, 1);
+  game.construction.setStageGate(p.id, 0, { mode: 'trial', item: 'ironPlate', n: 2 });
+  ticks(game, 10);
+  const fur = game.map.buildingAt(30, 34);
+  fur.slots.inputs.ironOre.count = 10;
+  for (let i = 0; i < 200; i++) {
+    ticks(game, 1);
+    if (p.stages[0].gate.opened) break;
+  }
+  ok(p.stages[0].gate.opened === true, '真实炼够铁板：闸门开放');
+  const byItemBefore = (fur.craftedByItem && fur.craftedByItem.ironPlate) || 0;
+  ok(byItemBefore >= 2, '建筑按产物分项计数 craftedByItem.ironPlate=' + byItemBefore);
+
+  const data = JSON.parse(JSON.stringify(game.serialize()));
+  ok(data.v === '1.8.0', '存档版本 1.8.0');
+  const sbFur = data.buildings.find(b => b.x === 30 && b.y === 34);
+  ok(sbFur.craftedByItem && sbFur.craftedByItem.ironPlate === byItemBefore,
+    '分项产量随存档保存');
+  const baseS = data.construction.plans[0].entries[0].base;
+  ok(baseS && typeof baseS.total === 'number' && baseS.items && typeof baseS.items === 'object',
+    '结构化试产基线 {total, items} 随存档保存');
+
+  const g2 = new FG.Game();
+  g2.deserialize(JSON.parse(JSON.stringify(data)));
+  const q = g2.construction.plans[0];
+  ok(q.stages[0].gate.opened === true, '新档往返：真实达标的已开放闸门保持开放（迁移不误伤）');
+  const fur2 = g2.map.buildingAt(30, 34);
+  ok(fur2.craftedByItem.ironPlate === byItemBefore, '读档后分项产量一致');
+}
+
+// ============================================================
+console.log('\n[17] 旧档（<1.8.0）迁移：误开放的试产闸门重新关闭、历史产量不串计，补产自动放行');
+{
+  const game = mkGame();
+  const chest = P(game, 'chest', 5, 5);
+  game.sim.chestAdd(chest, 'stone', 5);
+  game.sim.chestAdd(chest, 'ironPlate', 4);
+  game.sim.chestAdd(chest, 'circuit', 1);
+  const p = submit(game, [
+    bpEntry('furnace', 0, 0, 0, { recipe: 'smelt:iron' }),
+    bpEntry('lab', 1, 0, 0),
+  ], 38, 34);
+  game.construction.splitStage(p.id, 1);
+  game.construction.setStageGate(p.id, 0, { mode: 'trial', item: 'copperPlate', n: 3 });
+  ticks(game, 10);
+  const fur = game.map.buildingAt(38, 34);
+  // 手工构造旧版误放行现场：旧版只有 totalCrafted 总数、base 为数字，闸门已误开放
+  game.setRecipe(fur, 'smelt:copper');
+  fur.totalCrafted = 5;
+  fur.slots.inputs.copperOre.count = 10;
+  const data = JSON.parse(JSON.stringify(game.serialize()));
+  data.v = '1.7.0';
+  delete data.buildings[0].craftedByItem;
+  data.construction.plans[0].entries[0].base = 0;
+  data.construction.plans[0].stages[0].gate.opened = true;
+
+  const g2 = new FG.Game();
+  g2.deserialize(data);
+  const q = g2.construction.plans[0];
+  ok(q && q.stages[0].gate.opened === false, '旧档已误开放的试产闸门读入后重新关闭');
+  g2.construction.reconcileStages(q);
+  ok(g2.construction.trialProgress(q, 0) === 0,
+    '旧档历史无归属产量不串计：铜板试产 0/3（实际 ' + g2.construction.trialProgress(q, 0) + '）');
+  ok(!g2.map.buildingAt(39, 34), '后续阶段保持挂起');
+
+  const fur2 = g2.map.buildingAt(38, 34);
+  fur2.slots.inputs.copperOre.count = 12;
+  ticks(g2, 90);
+  ok(g2.construction.plans.length === 0 || g2.map.buildingAt(39, 34),
+    '旧档迁移后真正炼够 3 块铜板，闸门自动重新放行、阶段 2 建成');
+
+  // 无版本号的更旧导出档同样按旧档处理（已开放闸门不被信任）
+  const g3 = new FG.Game();
+  const data2 = JSON.parse(JSON.stringify(data));
+  delete data2.v;
+  g3.deserialize(data2);
+  const q3 = g3.construction.plans[0];
+  ok(q3 && q3.stages[0].gate.opened === false, '无版本号旧档同样重新核验已开放试产闸门');
 }
 
 console.log('\n结果：' + pass + ' 通过, ' + fail + ' 失败');

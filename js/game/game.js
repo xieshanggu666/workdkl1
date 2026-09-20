@@ -102,6 +102,8 @@ FG.Game = class Game {
         phase: b.phase, timer: b.timer,
         level: b.level, fluidType: b.fluidType, chest: b.chest, oreType: b.oreType,
         consumeCounter: b.consumeCounter, totalCrafted: b.totalCrafted,
+        craftedByItem: b.craftedByItem && Object.keys(b.craftedByItem).length
+          ? Object.assign({}, b.craftedByItem) : undefined,
         rr: b.rr, filter: b.filter, demandMode: b.demandMode,
         priority: b.priority, status: b.status,
         stationId: b.stationId || null, stationName: b.stationName || null,
@@ -172,6 +174,9 @@ FG.Game = class Game {
       b.oreType = sb.oreType || null;
       b.consumeCounter = sb.consumeCounter || 0;
       b.totalCrafted = sb.totalCrafted || 0;
+      // 按产物分项的完成次数：旧档无此字段 → {}（历史产量无产物归属，试产基线迁移时不计入）
+      b.craftedByItem = sb.craftedByItem && typeof sb.craftedByItem === 'object'
+        ? Object.assign({}, sb.craftedByItem) : {};
       b.rr = sb.rr || 0;
       b.filter = sb.filter || null;
       b.demandMode = !!sb.demandMode;
@@ -203,7 +208,7 @@ FG.Game = class Game {
       for (const id of Object.keys(data.totals)) this.stats.recordProduce(id, 0); // 登记 itemIds
     }
     // 施工计划与蓝图剪贴板（旧存档无此字段 → 空计划/空剪贴板）
-    this.construction.deserialize(data.construction || null);
+    this.construction.deserialize(data.construction || null, data.v);
     this.blueprint = data.blueprint || null;
     // 铁路：列车在途货物与调度状态随档恢复（占用表由列车位置重建）
     this.railway.deserialize(data.railway || null);

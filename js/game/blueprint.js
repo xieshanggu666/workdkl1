@@ -28,8 +28,12 @@
  *    重建设价备料）、闸门自动关闭、后续阶段挂起并释放预留；重建并再次达标后自动
  *    重新放行（阶段进度随存档保存）；
  *  - 缺料联动：活跃阶段缺料时同样挂起后续阶段（其预留本就不入账，统一在每 tick 释放）；
- *  - 试产基线：阶段进入试产等待时快照其内生产建筑的 totalCrafted（条目 base，null=未建立），
- *    试产增量按阶段内条目求和；阶段进度（切分/闸门/open/base）随存档保存。
+ *  - 试产基线：阶段进入试产等待时快照其内生产建筑的完成次数（条目 base，null=未建立）：
+ *    base = { total, items }，total=总完成次数（任意产物闸门用），items=按产物分项的
+ *    完成次数（限定产物闸门用）。生产侧对每种产物各自累计（建筑 craftedByItem），
+ *    因此切换配方后旧产物的次数不会串计到新产物（旧版只按 totalCrafted 总数统计，
+ *    切配方会误把旧产物次数计入新产物而错误放行）；阶段进度随存档保存，旧档读入时迁移
+ *    （数字基线懒迁移；旧版已误开放的试产闸门一律重新核验关闭，补产达标后自动再放行）。
  *
  * 原地升级（kind='upgrade'）：
  *  - 升级计划条目带 from（原建筑类型）：备料成本为新建筑造价，落成时把该格旧建筑
@@ -409,7 +413,8 @@ FG.Construction = class Construction {
 
   /**
    * 试产进度：阶段内生产建筑（配方建筑/矿机）相对基线 base 的完成次数增量；
-   * gate.item 限定产物，缺省（null/''）= 任意产物。非试产闸门/基线未建立返回 0。
+   * gate.item 限定产物（只统计该产物的分项完成次数，切换配方后旧产物不计入），
+   * 缺省（null/''）= 任意产物（按总完成次数）。非试产闸门/基线未建立返回 0。
    * 只读：基线由 ensureTrialBaseline 在阶段建成进入等待时建立，UI 轮询不产生副作用。
    */
   trialProgress(p, idx) {
@@ -418,16 +423,18 @@ FG.Construction = class Construction {
     let sum = 0;
     for (const i of this.stageEntryIdxs(p, idx)) {
       const e = p.entries[i];
-      if (typeof e.base !== 'number') continue;   // 基线未建立（阶段尚未建成进入等待）
+      if (!baseValid(e.base)) continue;   // 基线未建立（阶段尚未建成进入等待）
       const b = this.game.map.buildingAt(e.x, e.y);
       if (!b || !isProducer(e, b)) continue;
-      const delta = (b.totalCrafted || 0) - e.base;
-      if (delta <= 0) continue;
       if (g.item) {
-        const items = producerItems(this.game, e, b);
-        if (items.includes(g.item)) sum += delta;
+        // 按产物分项归属：只取该产物自身的完成次数，旧配方/其他产物的次数一律不计
+        const baseItems = baseItemsOf(e.base);
+        if (!baseItems) continue;   // 旧档数字基线：分项归属未知，等待 ensureTrialBaseline 懒迁移
+        const delta = (b.craftedByItem && b.craftedByItem[g.item] || 0) - (baseItems[g.item] || 0);
+        if (delta > 0) sum += delta;
       } else {
-        sum += delta;
+        const delta = (b.totalCrafted || 0) - e.base.total;
+        if (delta > 0) sum += delta;
       }
     }
     return sum;
@@ -627,17 +634,25 @@ FG.Construction = class Construction {
   }
 
   /**
-   * 建立试产基线：阶段内生产建筑的 totalCrafted 快照（base 未初始化时一次性写入）。
+   * 建立试产基线：阶段内生产建筑的完成次数快照（base 未初始化时一次性写入）。
+   * base = { total, items }：total=总完成次数（任意产物闸门用），
+   * items=按产物分项的完成次数快照（限定产物闸门用，切换配方后旧产物次数天然不计入）。
    * 在「阶段建成、进入试产等待」时调用——因此先建成后才把闸门改成试产，
    * 基线也取设置闸门当下的产量，历史产量不会被算入试产增量。
+   * 兼容旧档：条目 base 为旧版数字时懒迁移——以读档后建筑的当前分项产量为基线
+   * （旧档无产物归属，历史产量一律不计入试产，杜绝旧版「切配方误放行」随档延续）。
    * 闸门重开（建筑被拆重建后再次进入等待）会把回退条目的 base 清零，重新建基线。
    */
   ensureTrialBaseline(p, idx) {
     for (const i of this.stageEntryIdxs(p, idx)) {
       const e = p.entries[i];
       const b = this.game.map.buildingAt(e.x, e.y);
-      if (b && isProducer(e, b) && (e.base === undefined || e.base === null)) {
-        e.base = b.totalCrafted || 0;
+      if (!b || !isProducer(e, b)) continue;
+      if (e.base === undefined || e.base === null) {
+        e.base = { total: b.totalCrafted || 0, items: Object.assign({}, b.craftedByItem || {}) };
+      } else if (typeof e.base === 'number') {
+        // 旧版数字基线：total 沿用，分项基线取当前建筑分项计数（历史无归属产量不计入）
+        e.base = { total: e.base, items: Object.assign({}, b.craftedByItem || {}) };
       }
     }
   }
@@ -825,6 +840,7 @@ FG.Construction = class Construction {
     nb.filter = old.filter; nb.demandMode = old.demandMode;
     nb.priority = old.priority;
     nb.totalCrafted = old.totalCrafted;
+    nb.craftedByItem = Object.assign({}, old.craftedByItem || {});   // 分项产量随升级迁移，试产基线不断档
     g.sim.unregister(old);
     g.map.unregister(old);
     g.map.register(nb);
@@ -913,15 +929,19 @@ FG.Construction = class Construction {
           filter: e.filter, demandMode: e.demandMode, priority: e.priority, state: e.state,
           stationName: e.stationName || null,
           stock: Object.assign({}, e.stock),
-          base: (e.base === undefined || e.base === null) ? null : e.base,
+          // 试产基线：null=未建立；{total, items:{item:n}} 结构化快照（旧版数字基线读档时懒迁移）
+          base: serializeBase(e.base),
         })),
       })),
     };
   }
 
-  deserialize(data) {
+  deserialize(data, saveVersion) {
     this.plans = [];
     this.seq = (data && data.seq) || 1;
+    // 旧版（< 1.8.0）试产统计只按 totalCrafted 总数：切配方后旧产物次数会被计入新产物，
+    // 可能把试产闸门误开放并随存档保留。读旧档时对试产闸门做一次性重新核验（见下）。
+    const legacyTrial = isLegacyTrialSave(saveVersion);
     for (const sp of ((data && data.plans) || [])) {
       const entries = (sp.entries || []).map(e => ({
         type: e.type, from: e.from || null, x: e.x, y: e.y, dir: e.dir || 0,
@@ -930,7 +950,7 @@ FG.Construction = class Construction {
         stationName: e.stationName || null,
         state: e.state || 'wait',
         stock: e.stock || {},
-        base: (typeof e.base === 'number') ? e.base : null,   // 旧档无 base → 未建立（懒快照）
+        base: parseBase(e.base),   // null=未建立；数字=旧版基线（懒迁移）；{total,items}=新基线
       }));
       const n = entries.length;
       const plan = {
@@ -956,6 +976,7 @@ FG.Construction = class Construction {
       // 切分点规整（末尾补全到 n，剔除越界/重复），闸门随阶段序号保留
       this.normalizeStages(plan);
       plan.activeStage = 0;
+      if (legacyTrial) this.migrateLegacyTrialGates(plan);
       // 旧存档兼容：旧版预留记在计划级 p.stock，迁移到前沿待建条目，续建语义不变
       if (sp.stock && typeof sp.stock === 'object') {
         const head = entries.find(e => e.state === 'wait');
@@ -968,6 +989,24 @@ FG.Construction = class Construction {
     // 二次清理悬空依赖
     const ids = new Set(this.plans.map(p => p.id));
     for (const p of this.plans) p.deps = p.deps.filter(id => ids.has(id));
+  }
+
+  /**
+   * 旧档（试产按产物分项修复之前）迁移：
+   *  - 已开放的试产闸门无法区分「真达标」与「切配方误放行」→ 一律重新关闭、
+   *    作废阶段内旧基线（null，首次对账时以读档后当前产量重新快照），
+   *    后续阶段重新挂起；建筑继续生产达 n 次后闸门自动重新放行；
+   *  - 未开放闸门保留等待态：旧版数字基线在 ensureTrialBaseline 中懒迁移为
+   *    「以当前分项产量为基线」，历史无归属产量不计入（不会再被误判达标）。
+   */
+  migrateLegacyTrialGates(p) {
+    for (let k = 0; k < p.stages.length - 1; k++) {
+      const gate = p.stages[k].gate;
+      if (!gate || gate.mode !== 'trial' || !gate.opened) continue;
+      gate.opened = false;
+      for (const i of this.stageEntryIdxs(p, k)) p.entries[i].base = null;
+      p.activeStage = Math.min(p.activeStage || 0, k);
+    }
   }
 };
 
@@ -987,6 +1026,53 @@ function sanitizeGate(g) {
 /** 试产所需完成次数（缺省回退默认值） */
 function trialNeed(gate) {
   return Math.max(1, parseInt(gate && gate.n, 10) || FG.Config.STAGE_TRIAL_COUNT);
+}
+
+/** 试产基线是否已建立（null/undefined=未建立；旧版数字与新版 {total,items} 均视为已建立） */
+function baseValid(base) {
+  if (base === undefined || base === null) return false;
+  if (typeof base === 'number') return true;
+  return base && typeof base === 'object' && typeof base.total === 'number';
+}
+
+/** 基线的按产物分项快照：旧版数字基线尚未懒迁移时返回 null（item 闸门本轮不计入） */
+function baseItemsOf(base) {
+  return (base && typeof base === 'object' && base.items && typeof base.items === 'object') ? base.items : null;
+}
+
+/** 序列化试产基线：未建立→null；结构化快照原样（items 拷贝） */
+function serializeBase(base) {
+  if (base === undefined || base === null) return null;
+  if (typeof base === 'number') return base;   // 理论上读档后已懒迁移，兜底保留
+  return { total: base.total | 0, items: Object.assign({}, base.items || {}) };
+}
+
+/** 读档解析试产基线：数字=旧版（懒迁移）；{total,items}=新版；其余=null 未建立 */
+function parseBase(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'number') return raw;
+  if (typeof raw === 'object' && typeof raw.total === 'number') {
+    const items = {};
+    for (const k of Object.keys(raw.items || {})) {
+      const v = raw.items[k];
+      if (typeof v === 'number' && v > 0) items[k] = v;
+    }
+    return { total: raw.total | 0, items };
+  }
+  return null;
+}
+
+/**
+ * 是否为「试产按产物分项修复」之前的旧存档（< 1.8.0）：
+ * 旧版试产只按建筑 totalCrafted 总数统计，切配方后旧产物次数会计入新产物并可能误开闸。
+ * 无版本号（更早的存档/导出档）同样按旧档处理。
+ */
+function isLegacyTrialSave(v) {
+  if (typeof v !== 'string' || !v) return true;
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v);
+  if (!m) return true;
+  const major = +m[1], minor = +m[2];
+  return major < 1 || (major === 1 && minor < 8);
 }
 
 /**

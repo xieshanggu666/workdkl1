@@ -102,6 +102,7 @@ FG.Map = class {
       stationName: null,
       // 统计
       totalCrafted: 0,
+      craftedByItem: {},    // 按产物分项的累计完成次数（试产闸门按产物归属统计，切配方不串计）
     };
     if (def.storage) {
       for (let i = 0; i < FG.Config.CHEST_SLOTS; i++) b.chest.push({ type: null, count: 0, cap: FG.Config.CHEST_SLOT_CAP });

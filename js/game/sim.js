@@ -506,6 +506,9 @@ FG.Sim = class Sim {
           b.fluidTanks[r.item] = Math.min(FG.Config.FLUID_TANK_CAP, (b.fluidTanks[r.item] || 0) + r.count);
         } else {
           b.slots.outputs[r.item].count += r.count;
+          // 按产物分项记账：切换配方后，旧配方产物的次数不得计入新产物
+          // （分阶段试产闸门按产物统计；每次生产的每种固体产物各计 1 次）
+          b.craftedByItem[r.item] = (b.craftedByItem[r.item] || 0) + 1;
         }
         stats.recordProduce(r.item, r.count);
       }
@@ -543,6 +546,8 @@ FG.Sim = class Sim {
         ore.amount -= 2;
         this.game.stats.recordProduce(ore.type, 1);
         b.totalCrafted++;
+        // 按矿种分项记账（矿机产物固定为所在矿脉矿种，仍按项记录以统一试产统计口径）
+        b.craftedByItem[ore.type] = (b.craftedByItem[ore.type] || 0) + 1;
       }
     }
   }
